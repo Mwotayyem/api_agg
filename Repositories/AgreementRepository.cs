@@ -44,34 +44,29 @@ namespace AgreementAPI.Repositories
 
                 foreach (var item in request.ITEMS)
                 {
-                    // 1. Process Item History
-                    // Check if item exists and if it has changed
-                    var (shouldInsertItem, trnTypeId, lastItemState) = await CheckItemShouldInsert(connection, transaction, item);
+                    // 1. Process Item History - Detect ALL changes
+                    var changes = await DetectAllChanges(connection, transaction, item);
 
-                    int trnSerial = 0;
+                    int lastTrnSerial = 0;
 
-                    if (shouldInsertItem)
+                    if (changes.Count > 0)
                     {
-                        // Get Next TRN_SERIAL
-                        trnSerial = await GetNextTrnSerial(connection, transaction);
+                        foreach (var (trnTypeId, lastItemState) in changes)
+                        {
+                            // Get Next TRN_SERIAL for each change
+                            int trnSerial = await GetNextTrnSerial(connection, transaction);
 
-                        // Insert into MCEPOS_ITEMS with History (Old/New values)
-                        await InsertItemHistory(connection, transaction, trnSerial, trnTypeId, item, lastItemState);
-                        
-                        insertedItemsCount++;
-                        messages.Add($"✓ تم إدراج سجل حركة للمادة {item.ITEMNO} (نوع: {trnTypeId})");
+                            // Insert into MCEPOS_ITEMS with History (Old/New values)
+                            await InsertItemHistory(connection, transaction, trnSerial, trnTypeId, item, lastItemState);
+
+                            lastTrnSerial = trnSerial;
+                            insertedItemsCount++;
+                            messages.Add($"✓ تم إدراج سجل حركة للمادة {item.ITEMNO} (نوع: {trnTypeId})");
+                        }
                     }
                     else
                     {
                         messages.Add($"ℹ️ المادة {item.ITEMNO}: لم يتم اكتشاف أي تغيير في البيانات (موجودة مسبقاً).");
-                        
-                        // Even if we don't insert a new item record (no change), we might still need a TRN_SERIAL if we are inserting into Agreement?
-                        // If Agreement matches EXACTLY, we do nothing.
-                        // If Agreement differs, we insert into Agreement. What TRN_SERIAL to use?
-                        // If no item change, maybe we need the LATEST TRN_SERIAL of the item?
-                        // Or does Agreement get its own Serial? 
-                        // Schema: MCEPOS_AGREEMENT has TRN_SERAIL. 
-                        // SAFEST: Generate a new TRN_SERIAL for the Agreement Action if we are inserting into Agreement.
                     }
 
                     // 2. Process Agreement Link
@@ -81,13 +76,13 @@ namespace AgreementAPI.Repositories
                     if (!agreementExists)
                     {
                         // If we didn't generate a serial for item insert, generate one now.
-                        if (trnSerial == 0)
+                        if (lastTrnSerial == 0)
                         {
-                             trnSerial = await GetNextTrnSerial(connection, transaction);
+                             lastTrnSerial = await GetNextTrnSerial(connection, transaction);
                         }
 
                         // Insert into MCEPOS_AGREEMENT
-                        await InsertAgreementRow(connection, transaction, trnSerial, agrSerial, request, item, startDate, endDate);
+                        await InsertAgreementRow(connection, transaction, lastTrnSerial, agrSerial, request, item, startDate, endDate);
                         
                         insertedAgreementsCount++;
                         messages.Add($"✓ تم ربط المادة {item.ITEMNO} بالاتفاقية {request.AGREEMENT_NO}");
@@ -119,14 +114,17 @@ namespace AgreementAPI.Repositories
 
         // Removed UpdateItems method as requested (Only Inserts allowed)
 
-        private async Task<(bool ShouldInsert, int TrnTypeId, ItemHistoryState? LastState)> CheckItemShouldInsert(
+        private async Task<List<(int TrnTypeId, ItemHistoryState? LastState)>> DetectAllChanges(
             OracleConnection connection, OracleTransaction transaction, ItemDto newItem)
         {
-            // Get Latest Item Record
+            var changes = new List<(int TrnTypeId, ItemHistoryState? LastState)>();
+            
+            // Get Latest Item Record for this ITEMNO + TRN_TYPE_PRICE combination
             string sql = @"
                 SELECT TRN_ITEMBARCODE, TRN_ITEMPRICE, TRN_ITEMSHORTNAME, TRN_ITEMSTOP, TRN_SERIAL, TRN_TYPE_PRICE
                 FROM COMMDIV.MCEPOS_ITEMS 
                 WHERE TRN_ITEMCODE = :itemNo 
+                AND TRN_TYPE_PRICE = :typePrice
                 ORDER BY TRN_SERIAL DESC 
                 FETCH FIRST 1 ROW ONLY";
 
@@ -134,12 +132,12 @@ namespace AgreementAPI.Repositories
             cmd.Transaction = transaction;
             cmd.BindByName = true;
             cmd.Parameters.Add(":itemNo", OracleDbType.Varchar2).Value = newItem.ITEMNO;
+            cmd.Parameters.Add(":typePrice", OracleDbType.Int32).Value = newItem.TRN_TYPE_PRICE;
 
             using var reader = await cmd.ExecuteReaderAsync();
             
             if (await reader.ReadAsync())
             {
-                var trnSerial = reader.IsDBNull(4) ? 0 : reader.GetInt32(4);
                 var lastState = new ItemHistoryState
                 {
                     Barcode = reader.IsDBNull(0) ? null : reader.GetString(0),
@@ -149,28 +147,25 @@ namespace AgreementAPI.Repositories
                     TypePrice = reader.IsDBNull(5) ? 0 : reader.GetInt32(5)
                 };
 
-                // Compare logic - Priority Order as implicit in requirements
-                if (newItem.ITEMSTOP == 1) return (true, 5, lastState); // STOP
+                // Detect ALL changes independently
+                if (newItem.ITEMSTOP == 1) 
+                    changes.Add((5, lastState)); // STOP
                 
-                if (lastState.Barcode != newItem.BARCODE) return (true, 2, lastState); // BARCODE CHANGE
+                if (lastState.Barcode != newItem.BARCODE) 
+                    changes.Add((2, lastState)); // BARCODE CHANGE
                 
-                // Name Change
-                if (lastState.Name != newItem.ITEMSHORTNAME) return (true, 4, lastState); 
+                if (lastState.Name != newItem.ITEMSHORTNAME) 
+                    changes.Add((4, lastState)); // NAME CHANGE
 
-                // Price or TypePrice Change
-                // Note: User mentioned TRN_TYPE_PRICE change should be treated usually as price change logic or similar.
-                // Assuming Type 3 for price/type_price changes.
-                if (lastState.Price != newItem.ITEMPRICE || lastState.TypePrice != newItem.TRN_TYPE_PRICE) 
-                {
-                     return (true, 3, lastState); 
-                }
+                if (lastState.Price != newItem.ITEMPRICE) 
+                    changes.Add((3, lastState)); // PRICE CHANGE
                 
-                // If identical, do NOT insert
-                return (false, 0, lastState);
+                return changes;
             }
 
-            // No record found -> First Insert
-            return (true, 1, null);
+            // No record found -> First Insert for this ITEMNO + TRN_TYPE_PRICE combination
+            changes.Add((1, null));
+            return changes;
         }
 
         private async Task InsertItemHistory(OracleConnection connection, OracleTransaction transaction, 
@@ -204,15 +199,17 @@ namespace AgreementAPI.Repositories
             cmd.Parameters.Add(":price", OracleDbType.Decimal).Value = item.ITEMPRICE;
             cmd.Parameters.Add(":stop", OracleDbType.Int32).Value = item.ITEMSTOP;
 
-            // History Columns
-            // Explicitly force NULL for Type 1 (New Item)
-            bool isNewItem = trnTypeId == 1;
-            bool isUpdate = lastState != null && !isNewItem;
+            // History Columns - Populate based on TRN_TYPEID
+            // Type 1: New Item - No OLD/NEW values
+            // Type 2: Barcode Change - Only populate barcode OLD/NEW
+            // Type 3: Price Change - Only populate price OLD/NEW
+            // Type 4: Name Change - Only populate name OLD/NEW
+            // Type 5: Stop - No OLD/NEW values needed
 
-            // Barcode Change
-            if (isUpdate && lastState?.Barcode != item.BARCODE)
+            // Barcode Change (Type 2)
+            if (trnTypeId == 2 && lastState != null)
             {
-                cmd.Parameters.Add(":oldBarcode", OracleDbType.Varchar2).Value = lastState?.Barcode;
+                cmd.Parameters.Add(":oldBarcode", OracleDbType.Varchar2).Value = lastState.Barcode ?? (object)DBNull.Value;
                 cmd.Parameters.Add(":newBarcode", OracleDbType.Varchar2).Value = item.BARCODE;
             }
             else
@@ -221,10 +218,10 @@ namespace AgreementAPI.Repositories
                 cmd.Parameters.Add(":newBarcode", OracleDbType.Varchar2).Value = DBNull.Value;
             }
 
-            // Price Change
-            if (isUpdate && lastState?.Price != item.ITEMPRICE)
+            // Price Change (Type 3)
+            if (trnTypeId == 3 && lastState != null)
             {
-                cmd.Parameters.Add(":oldPrice", OracleDbType.Decimal).Value = lastState?.Price;
+                cmd.Parameters.Add(":oldPrice", OracleDbType.Decimal).Value = lastState.Price;
                 cmd.Parameters.Add(":newPrice", OracleDbType.Decimal).Value = item.ITEMPRICE;
             }
             else
@@ -233,10 +230,10 @@ namespace AgreementAPI.Repositories
                 cmd.Parameters.Add(":newPrice", OracleDbType.Decimal).Value = DBNull.Value;
             }
 
-            // Name Change
-            if (isUpdate && lastState?.Name != item.ITEMSHORTNAME)
+            // Name Change (Type 4)
+            if (trnTypeId == 4 && lastState != null)
             {
-                 cmd.Parameters.Add(":oldName", OracleDbType.Varchar2).Value = lastState?.Name;
+                 cmd.Parameters.Add(":oldName", OracleDbType.Varchar2).Value = lastState.Name ?? (object)DBNull.Value;
                  cmd.Parameters.Add(":newName", OracleDbType.Varchar2).Value = item.ITEMSHORTNAME;
             }
             else
